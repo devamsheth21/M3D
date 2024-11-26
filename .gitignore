@@ -1,0 +1,33 @@
+# Ignore weight files
+*.h5
+*.weights
+*.tar
+*.pth
+*.pt
+*.bin
+*.pkl
+*events.out*
+*nii.gz*
+
+# Ignore image files
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+
+# Ignore numpy files
+*.npy
+*.npz
+
+# Ignore other common files
+*.log
+*.csv
+*.tsv
+*.json
+*.xml
+
+# Ignore directories
+__pycache__/
+.ipynb_checkpoints/

@@ -9,6 +9,50 @@ from .segmentation_module.builder import build_segmentation_module
 from LaMed.src.model.loss import BCELoss, BinaryDiceLoss
 
 
+class AttentionAggregator(nn.Module):
+    def __init__(self, hidden_size, num_heads):
+        super().__init__()
+        print(f"AttentionAggregator hidden_size: {hidden_size}, num_heads: {num_heads}")
+        self.attention = nn.MultiheadAttention(hidden_size, num_heads, batch_first = True )
+        self.layer_norm = nn.LayerNorm(hidden_size)
+
+        # Linear layer to reduce sequence length from num_parts * 256 to 256
+        total_seq_length = 8 * 256  # Define num_parts appropriately
+        self.reduce_seq_length = nn.Linear(total_seq_length, 256)
+
+    def forward(self, image_embeddings):
+        # image_embeddings shape: [batch_size, seq_length, hidden_size]
+        print(f"Initial image_embeddings shape: {image_embeddings.shape} and type: {type(image_embeddings)}")
+        # image_embeddings = image_embeddings.as_tensor()
+        print(f"Initial image_embeddings shape CONVERTED: {image_embeddings.shape} and type: {type(image_embeddings)}")
+        # Debug projection weights and bias
+        print(f"out_proj_weight shape: {self.attention.out_proj.weight.shape}")
+        print(f"out_proj_bias shape: {self.attention.out_proj.bias.shape}")
+        # self.attention.out_proj.bias = nn.Parameter(torch.zeros(2048))
+        # self.attention.out_proj.weight = nn.Parameter(torch.ones(2048, 2048))
+        
+        # Transpose for MultiheadAttention: [seq_length, batch_size, hidden_size]
+        # image_embeddings = image_embeddings.transpose(0, 1)
+        # print(f"image_embeddings shape after transpose: {image_embeddings.shape}")
+        # Apply multihead attention
+        # attn_output, _ = self.attention(image_embeddings, image_embeddings, image_embeddings)
+        attn_output, _ = self.attention(image_embeddings, image_embeddings, image_embeddings , need_weights=False)
+        
+        print(f"attn_output shape after attention: {attn_output}")
+
+        # Apply layer normalization
+        attn_output = self.layer_norm(attn_output)
+
+        # # Transpose back: [batch_size, seq_length, hidden_size]
+        # attn_output = attn_output.transpose(0, 1)
+
+        # Reduce sequence length to 256
+        attn_output = attn_output.transpose(1, 2)  # Shape: [batch_size, hidden_size, seq_length]
+        aggregated_features = self.reduce_seq_length(attn_output)  # Shape: [batch_size, hidden_size, 256]
+        aggregated_features = aggregated_features.transpose(1, 2)  # Shape: [batch_size, 256, hidden_size]
+
+        return aggregated_features
+
 class LamedMetaModel:
     def __init__(self, config):
         super(LamedMetaModel, self).__init__(config)
@@ -33,6 +77,19 @@ class LamedMetaModel:
 
             self.dice_loss = BinaryDiceLoss()
             self.bce_loss = BCELoss()
+        
+        # Initialize Attention Aggregator
+        if hasattr(config, "attention_aggregator"):
+            print(f" in HASATTR AttentionAggregator hidden_size: {config.hidden_size}, num_heads: {config.num_heads}")
+            self.attention_aggregator = AttentionAggregator(config.hidden_size, config.num_heads)
+            self.attention_aggregator.requires_grad_(True) # Enable training the attention aggregator
+
+    def initialize_attention_aggregator(self, model_args):
+        self.config.num_heads = model_args.num_heads
+        print(f"IN initialize AttentionAggregator hidden_size: {self.config.hidden_size}, num_heads: {self.config.num_heads}")
+        if getattr(self, 'attention_aggregator', None) is None:
+            self.attention_aggregator = AttentionAggregator(self.config.hidden_size, self.config.num_heads)
+
 
     def get_vision_tower(self):
         vision_tower = getattr(self, 'vision_tower', None)
@@ -114,11 +171,35 @@ class LamedMetaForCausalLM(ABC):
 
     def encode_images(self, images):
         image_features = self.get_model().get_vision_tower()(images)
-        print(f"In vit output shape: {image_features.shape}")
         image_features = self.get_model().mm_projector(image_features)
-        print(f"In mm_projector output shape: {image_features.shape}")
         return image_features
+    def encode_images2(self, images):
+        # images shape: [batch_size, num_parts, channels, D, H, W]
+        print(f"Input image shape: {images.shape}")
+        batch_size, num_parts, channels, D, H, W = images.shape
 
+        # Reshape to process each part individually
+        images = images.view(batch_size * num_parts, channels, D, H, W)
+        # ViT output shape: [batch_size * num_parts, tokens, embedding_dim]
+        image_features = self.get_model().get_vision_tower()(images)
+        print(f"ViT output shape: {image_features.shape}")
+        # Apply mm_projector to each part
+        # mm_projector output shape: [batch_size * num_parts, 256, 3072]
+        image_features = self.get_model().mm_projector(image_features)
+        print(f"mm_projector output shape: {image_features.shape}")
+        # Reshape back to [batch_size, num_parts, 256, 3072]
+        image_features = image_features.view(batch_size, num_parts, 256, 3072)
+
+        # Combine parts by concatenating along the sequence length
+        # Resulting shape: [batch_size, num_parts * 256, 3072]
+        image_embeddings = image_features.contiguous().view(batch_size, num_parts * 256, 3072)
+        print(f"Input to attention : {image_embeddings}")
+        print(f"Input to attention shape: {image_embeddings.shape}")
+        # Apply attention aggregator to reduce sequence length back to 256
+        # Final output shape: [batch_size, 256, 3072]
+        image_features = self.get_model().attention_aggregator(image_embeddings)
+        print(f"Output of attention aggregator shape: {image_features.shape}")
+        return image_features
     def prepare_inputs_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
         images,
@@ -127,12 +208,31 @@ class LamedMetaForCausalLM(ABC):
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
         else:
-            image_features = self.encode_images(images)
-            print(f"In prepare_inputs_for_multimodal features : {image_features.shape} and input_ids : {input_ids.shape}")
+            image_features = self.encode_images2(images)
+            # image_features = []
+            # # Get image features for each image part
+            # for i in range(images.shape[1]):
+            #     image_part = images[:, i, :, :, :]
+            #     print(f"Image part shape: {image_part.shape}")
+            #     image_feature = self.encode_images(image_part)
+            #     image_features.append(image_feature)
+
+            # # Stack image features to form a tensor
+            # image_features = torch.stack(image_features)
+            # # Transpose to [batch_size, num_parts, tokens, embedding_dim]
+            # image_features = image_features.transpose(0, 1)
+            # print(f"Image features shape: {image_features.shape}")
+            # # Aggregate image features using attention
+            # batch_size, num_parts, tokens, embedding_dim = image_features.shape
+            # image_embeddings = image_features.reshape(batch_size, num_parts * tokens, embedding_dim)
+            # print(f"Image embeddings shape: {image_embeddings.shape}")
+            # image_features = self.get_model().attention_aggregator(image_embeddings)
+            # print(f"Aggregated image features shape: {image_features.shape}")
+            # image_features = image_features.mean(dim=0)  # [1, mm_hidden_size]
+            # print(f"Meaned image features shape: {image_features.shape}")
             inputs_embeds = self.get_model().embed_tokens(input_ids)
             inputs_embeds = torch.cat(
                 (inputs_embeds[:, :1, :], image_features, inputs_embeds[:, (image_features.shape[1] + 1):, :]), dim=1)
-            print(f"In prepare_inputs_for_multimodal inputs_embeds : {inputs_embeds.shape}")
         return None, position_ids, attention_mask, past_key_values, inputs_embeds, labels
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
