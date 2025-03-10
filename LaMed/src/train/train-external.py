@@ -24,8 +24,8 @@ print(f"Using devices: {os.environ['CUDA_VISIBLE_DEVICES']}")
 local_rank = None
 
 def rank0_print(*args):
-    if local_rank == 0:
-        print(*args)
+    print(f" Rank:{local_rank}") 
+    print(*args)
 def print_memory_usage():
     print(f"Allocated memory: {torch.cuda.memory_allocated() / (1024 ** 3):.2f} GB")
     print(f"Reserved memory: {torch.cuda.memory_reserved() / (1024 ** 3):.2f} GB")
@@ -111,7 +111,9 @@ class TrainingArguments(transformers.TrainingArguments):
             "Maximum sequence length. Sequences will be right padded (and possibly truncated)."
         },
     )
+    seed: int = 42
     ddp_backend: str = "nccl"
+    ddp_timeout: int = 128000
     ddp_find_unused_parameters: bool = False
     optim: str = field(default="adamw_torch")
 
@@ -222,7 +224,7 @@ def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
     # Process of elimination: LoRA only targets on LLM backbone
-    ignore_keywords = ['vision_tower', 'mm_projector', 'embed_tokens', 'lm_head', 'seg_projector', 'seg_module']
+    ignore_keywords = ['vision_tower', 'mm_projector', 'embed_tokens', 'lm_head', 'seg_projector', 'seg_module', 'attention_aggregator']
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in ignore_keywords):
             continue
@@ -309,6 +311,9 @@ def main():
 
     if tokenizer.unk_token is not None and tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.unk_token
+    if 'llama3' in model_args.model_type:
+        tokenizer.eos_token_id = 128001
+        tokenizer.pad_token = tokenizer.eos_token
 
     # Convert special tokens to token IDs and set related arguments
     model_args.img_token_id = tokenizer.convert_tokens_to_ids("<im_patch>")
@@ -322,7 +327,9 @@ def main():
         if 'llama' in model_args.model_type:
             model = LamedLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
-                cache_dir=training_args.cache_dir
+                cache_dir=training_args.cache_dir,
+                bos_token_id=tokenizer.bos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
             )
         elif 'phi3' in model_args.model_type:
             model = LamedPhi3ForCausalLM.from_pretrained(
@@ -385,6 +392,8 @@ def main():
         )
         rank0_print("Adding LoRA adapters only on LLM.")
         model = get_peft_model(model, lora_config)
+        # After applying LoRA
+        # Apply LoRA modifications...
 
         for n, p in model.named_parameters():
             if any(

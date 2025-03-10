@@ -4,11 +4,10 @@
 *.tar
 *.pth
 *.pt
-*.bin
 *.pkl
 *events.out*
 *nii.gz*
-
+*.bin
 # Ignore image files
 *.png
 *.jpg
@@ -31,3 +30,7 @@
 # Ignore directories
 __pycache__/
 .ipynb_checkpoints/
+
+# Ignore data
+Data/data
+

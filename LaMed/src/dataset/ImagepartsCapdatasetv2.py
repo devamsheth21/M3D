@@ -236,7 +236,7 @@ class CapDataset(Dataset):
                     'input_id': input_id,
                     'prompt_question': prompt_question,
                     'attention_mask': attention_mask,
-                    'question': question,
+                    'question': question_tensor,
                     'answer': answer,
                     'question_type': "Caption-0",
                     'image_path': data['Image'],
